@@ -4,24 +4,54 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
+import math
 
 class LoRaMeshSim:
     def __init__(self, root):
         self.root = root
         self.root.title("LoRa Mesh Network Simulator")
+
+        # --- Фізичні параметри LoRa (SX127x) ---
+        self.v_supply = 3.3       # Напруга живлення (В)
+        self.i_tx = 0.028         # Струм передачі (28 мА при +13 дБм)
+        self.i_rx = 0.0103        # Струм прийому (10.3 мА при BW 125 кГц)
         
+        # Параметри протоколу
+        self.sf = 7               # Spreading Factor
+        self.bw = 125000          # Bandwidth (Гц)
+        self.cr = 1               # Coding Rate (1=4/5)
+        self.payload_len = 20     # Розмір повідомлення (байтів)
+        self.preamble_len = 8     # Довжина преамбули
+
         # Початкові параметри 
         self.nodes_count = tk.IntVar(value=30)
         self.r_max = tk.DoubleVar(value=2.0)
         self.field_size = tk.DoubleVar(value=6.0)
-        self.packets_per_node = 100 # Кожен вузол генерує 100 пакетів
+        self.packets_per_node = 100
         self.gateway_pos = np.array([0.0, 0.0])
         self.nodes = None
         
         self.setup_ui()
+    
+    def calculate_toa(self):
+        t_symbol = (2**self.sf) / self.bw
+        t_preamble = (self.preamble_len + 4.25) * t_symbol
+        
+        # Коефіцієнт оптимізації низької швидкості (LDRO)
+        de = 1 if (t_symbol > 0.016) else 0
+        
+        # Формула кількості символів корисного навантаження
+        payload_symb_nb = 8 + max(
+            math.ceil(
+                (8 * self.payload_len - 4 * self.sf + 28 + 16 - 0) / 
+                (4 * (self.sf - 2 * de))
+            ) * (self.cr + 4), 0
+        )
+        t_payload = payload_symb_nb * t_symbol
+        return t_preamble + t_payload
 
     def setup_ui(self):
-        ctrl_frame = ttk.LabelFrame(self.root, text="Параметри симуляції")
+        ctrl_frame = ttk.LabelFrame(self.root, text="Параметри симуляції (LoRa SX1276)")
         ctrl_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
 
         ttk.Label(ctrl_frame, text="Кількість вузлів:").pack(pady=5)
@@ -34,6 +64,10 @@ class LoRaMeshSim:
         ttk.Entry(ctrl_frame, textvariable=self.field_size).pack()
 
         ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        toa = self.calculate_toa() * 1000 # в мс
+        ttk.Label(ctrl_frame, text=f"SF: {self.sf} | BW: {self.bw/1000}kHz", foreground="darkgreen").pack()
+        ttk.Label(ctrl_frame, text=f"Packet ToA: {toa:.2f} ms", font=('Arial', 9, 'bold')).pack()
         
         ttk.Button(ctrl_frame, text="Генерувати вузли", command=self.generate_nodes).pack(fill='x', pady=5)
         ttk.Button(ctrl_frame, text="Запустити симуляцію", command=self.run_simulation).pack(fill='x', pady=5)
@@ -44,7 +78,6 @@ class LoRaMeshSim:
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect('button_press_event', self.on_click)
-        
         self.generate_nodes()
 
     def on_click(self, event):
@@ -55,6 +88,7 @@ class LoRaMeshSim:
     def generate_nodes(self):
         size = self.field_size.get()
         count = self.nodes_count.get()
+
         # Генерація випадкових координат
         self.nodes = np.random.uniform(-size/2, size/2, (count, 2))
         self.draw_network()
@@ -63,7 +97,7 @@ class LoRaMeshSim:
         self.ax.clear()
         self.ax.scatter(self.nodes[:,0], self.nodes[:,1], c='gray', alpha=0.5, label='Вузли')
         self.ax.scatter(self.gateway_pos[0], self.gateway_pos[1], c='gold', s=200, marker='*', edgecolors='black', label='Gateway')
-        self.ax.set_title("Мапа мережі (Налаштування)")
+        self.ax.set_title("Попередній перегляд структури мережі (Клікніть для переміщення GW)")
         self.ax.grid(True, linestyle=':')
         self.canvas.draw()
 
@@ -91,30 +125,43 @@ class LoRaMeshSim:
                     hops[v] = hops[u] + 1
                     parent[v] = u
                     q.append(v)
-
+        # Розрахунок енергії
+        t_packet = self.calculate_toa()
+        e_tx_packet = self.v_supply * self.i_tx * t_packet  # Енергія на 1 передачу (Дж)
+        e_rx_packet = self.v_supply * self.i_rx * t_packet  # Енергія на 1 прийом (Дж)
+        
         # Симуляція трафіку, навантаження та енергоспоживання
-        node_load = np.zeros(n)
         energy_spent = np.zeros(n)
+        node_load = np.zeros(n)
         successful_packets = 0
         total_packets = (n - 1) * self.packets_per_node
 
         for node_idx in range(1, n):
             if hops[node_idx] != -1:
-                # Шлях пакету від вузла до центру
                 successful_packets += self.packets_per_node
                 curr = node_idx
-                while curr != 0:
-                    node_load[curr] += self.packets_per_node
-                    # TX/RX витрати енергії
-                    energy_spent[curr] += self.packets_per_node * 1.5 
-                    curr = parent[curr]
+                
+                energy_spent[curr] += self.packets_per_node * e_tx_packet
+                node_load[curr] += self.packets_per_node
 
-        self.show_results(hops, r, node_load, energy_spent, successful_packets, total_packets)
+                p = parent[curr]
+                while p != 0: # Поки не дійшли до Gateway
+                    # Ретранслятор спочатку приймає, потім передає
+                    energy_spent[p] += self.packets_per_node * (e_rx_packet + e_tx_packet)
+                    node_load[p] += self.packets_per_node
+                    curr = p
+                    p = parent[curr]
 
-    def show_results(self, hops, r, load, energy, success, total):
+        self.show_results(hops, r, node_load, energy_spent, successful_packets, total_packets, t_packet)
+
+    def show_results(self, hops, r, load, energy, success, total, t_packet):
         res_win = tk.Toplevel(self.root)
-        res_win.title("Результати аналізу LoRa Mesh")
+        res_win.title("Результати аналізу LoRa Star vs LoRa Mesh (SX1276)")
         res_win.geometry("1100x750")
+
+        avg_e = np.mean(energy[1:])
+        total_e = np.sum(energy[1:])
+        max_node = np.argmax(energy[1:]) + 1
 
         # Розрахунок метрик
         star_mask = np.linalg.norm(self.nodes - self.gateway_pos, axis=1) <= r
@@ -140,19 +187,21 @@ PDR (Доставка даних):
 • Star (LoRaWAN): {star_pdr:.1f}%
 • Mesh (LoRa):    {mesh_pdr:.1f}%
 
-Енергетичний аналіз (умовні од.):
-• Сер. витрати вузла: {avg_energy:.1f}
-• Max витрати (Hub):  {max_energy:.1f}
-• Всього витрачено:   {np.sum(energy):.1f}
+=== ЕНЕРГЕТИЧНІ ЗАТРАТИ SX1276 (3.3V) ===
+
+Час передачі пакета: {t_packet*1000:.2f} мс
+Витрати на 1 TX: {self.v_supply*self.i_tx*t_packet*1000:.3f} мДж
+Витрати на 1 RX: {self.v_supply*self.i_rx*t_packet*1000:.3f} мДж
+
+--- ПІДСУМКИ ---
+Загальна енергія: {total_e:.3f} Дж
+Середня на вузол: {avg_e*1000:.2f} мДж
 
 Критичні вузли (Top Load):
 1. Вузол #{top_relay_indices[0]}: {int(load[top_relay_indices[0]])} пак.
 2. Вузол #{top_relay_indices[1]}: {int(load[top_relay_indices[1]])} пак.
 3. Вузол #{top_relay_indices[2]}: {int(load[top_relay_indices[2]])} пак.
-
-*Вузли з витратою > {avg_energy*2:.0f} од. 
-потребують більшої ємності АКБ.
-        """
+"""
         tk.Label(info_frame, text=results_text, justify=tk.LEFT, font=("Courier", 10), 
                  background="#f8f9fa", relief="solid", padx=15, pady=15).pack(pady=10)
         
@@ -180,7 +229,11 @@ PDR (Доставка даних):
                                         ),
                                         zorder=2)
                         break
-
+        
+        max_e = np.max(energy[1:]) if len(energy) > 1 else 1
+        if max_e == 0: 
+            max_e = 1 # Запобігання діленню на нуль
+        
         # Візуалізація вузлів
         for i in range(1, len(all_pts)):
             # Колір за станом зв'язку
@@ -193,11 +246,12 @@ PDR (Доставка даних):
             
             # Розмір вузла тепер відображає витрачену енергію
             # Базовий розмір 50 + енергія/2 для наочності
-            e_size = 50 + (energy[i] / 2)
-            
+            relative_energy = energy[i] / max_e
+            e_size = 60 + (relative_energy * 400) 
+
             scatter = ax_res.scatter(all_pts[i,0], all_pts[i,1], c=color, s=e_size, 
-                                     edgecolors='black', alpha=0.7, zorder=3)
-            
+                                    edgecolors='black', alpha=0.7, zorder=3)
+                        
             # Додаємо підпис енергії для найбільш навантажених
             if energy[i] > avg_energy * 1.5:
                 ax_res.text(all_pts[i,0], all_pts[i,1]-0.3, f"E:{int(energy[i])}", 
