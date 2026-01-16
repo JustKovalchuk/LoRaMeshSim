@@ -6,6 +6,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
 from collections import deque
 import math
+import random
 
 class LoRaMeshSim:
     def __init__(self, root):
@@ -33,22 +34,19 @@ class LoRaMeshSim:
         self.preamble_len = 8     # Довжина преамбули
 
         # Налаштування поля та вузлів
+        self.unit_mode = tk.StringVar(value="Joules")
         self.nodes_count = tk.IntVar(value=30)
+        self.obstacles_count = tk.IntVar(value=4)
         self.r_max = tk.DoubleVar(value=2.0)
         self.field_size = tk.DoubleVar(value=6.0)
         self.packets_per_node = 100
         self.gateway_pos = np.array([0.0, 0.0])
         self.nodes = None
-        
-        # --- Перешкоди (x, y, width, height) ---
-        # Створимо кілька статичних стін
-        self.obstacles = [
-            (-1.5, -0.5, 3.0, 0.4),  # Горизонтальна стіна
-            (-0.5, 1.0, 0.4, 2.0),   # Вертикальна стіна
-            (1.0, -2.5, 0.4, 1.5)    # Ще одна перешкода
-        ]
+        self.obstacles = []
         
         self.setup_ui()
+        self.generate_obstacles()
+        self.generate_nodes()
 
     def calculate_toa(self, crc_enabled=True, implicit_header=False):
         t_symbol = (2**self.sf) / self.bw
@@ -65,6 +63,7 @@ class LoRaMeshSim:
         t_preamble = (self.preamble_len + 4.25) * t_symbol
         t_payload = payload_symb_nb * t_symbol
         return t_preamble + t_payload
+    
     def line_intersects_rect(self, p1, p2, rect):
         """Перевірка чи перетинає відрізок p1-p2 прямокутник rect (x, y, w, h)"""
         x, y, w, h = rect
@@ -80,7 +79,68 @@ class LoRaMeshSim:
             if self.segments_intersect(p1, p2, r_p1, r_p2):
                 return True
         return False
+    
+    def generate_obstacles(self):
+        """Генерує випадкові прямокутні перешкоди"""
+        self.obstacles = []
+        size = self.field_size.get()
+        target_count = self.obstacles_count.get()
 
+        # Функція для перевірки перетину двох прямокутників
+        def rects_overlap(r1, r2):
+            # r = (x, y, w, h)
+            return not (r1[0] + r1[2] < r2[0] or 
+                        r1[0] > r2[0] + r2[2] or 
+                        r1[1] + r1[3] < r2[1] or 
+                        r1[1] > r2[1] + r2[3])
+        
+        max_attempts = 1000
+        attempts = 0
+
+        while len(self.obstacles) < target_count and attempts < max_attempts:
+            attempts += 1
+            # Випадково обираємо тип: 0 - будинок (квадратний), 1 - стіна (довга)
+            obs_type = random.randint(0, 1)
+            
+            if obs_type == 0:
+                w = random.uniform(size * 0.05, size * 0.1)
+                h = random.uniform(size * 0.05, size * 0.1)
+            else:
+                if random.random() > 0.5:
+                    w = random.uniform(size * 0.1, size * 0.4)
+                    h = random.uniform(0.05, 0.05)
+                else:
+                    w = random.uniform(0.05, 0.05)
+                    h = random.uniform(size * 0.1, size * 0.4)
+
+            x = random.uniform(-size/2, size/2 - w)
+            y = random.uniform(-size/2, size/2 - h)
+            new_rect = (x, y, w, h)
+            
+            margin = 0.3
+            gw_rect = (self.gateway_pos[0] - margin, self.gateway_pos[1] - margin, margin*2, margin*2)
+            if rects_overlap(new_rect, gw_rect):
+                continue
+            
+            gap = 0.1
+            collision = False
+            for obs in self.obstacles:
+                if rects_overlap((x-gap, y-gap, w+gap*2, h+gap*2), obs):
+                    collision = True
+                    break
+            
+            if not collision:
+                self.obstacles.append(new_rect)
+        
+        if self.nodes is not None:
+            self.draw_network()
+
+    def clear_obstacles(self):
+        self.obstacles = []
+        
+        self.obstacles_count.set(0)
+        self.draw_network()
+    
     def segments_intersect(self, a, b, c, d):
         """Перевірка перетину двох відрізків AB та CD"""
         def ccw(A, B, C):
@@ -98,6 +158,9 @@ class LoRaMeshSim:
         ctrl_frame = ttk.LabelFrame(self.root, text="Параметри симуляції (LoRa SX1276)")
         ctrl_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
 
+        ttk.Label(ctrl_frame, text="Кількість перешкод:").pack()
+        ttk.Entry(ctrl_frame, textvariable=self.obstacles_count).pack(pady=2)
+
         ttk.Label(ctrl_frame, text="Кількість вузлів:").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.nodes_count).pack()
 
@@ -109,40 +172,66 @@ class LoRaMeshSim:
 
         ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
 
+        ttk.Label(ctrl_frame, text="Одиниці вимірювання енергії:").pack(pady=5)
+        ttk.Radiobutton(ctrl_frame, text="Джоулі (J/mJ)", variable=self.unit_mode, value="Joules").pack(anchor=tk.W)
+        ttk.Radiobutton(ctrl_frame, text="Ампер-години (mAh)", variable=self.unit_mode, value="mAh").pack(anchor=tk.W)
+        
+        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
+
         toa = self.calculate_toa() * 1000 # в мс
         ttk.Label(ctrl_frame, text=f"SF: {self.sf} | BW: {self.bw/1000}kHz", foreground="darkgreen").pack()
         ttk.Label(ctrl_frame, text=f"Packet ToA: {toa:.2f} ms").pack()
         
+        ttk.Button(ctrl_frame, text="Генерувати перешкоди", command=self.generate_obstacles).pack(fill='x', pady=5)
+        ttk.Button(ctrl_frame, text="Очистити перешкоди", command=self.clear_obstacles).pack(fill='x', pady=2)
         ttk.Button(ctrl_frame, text="Генерувати вузли", command=self.generate_nodes).pack(fill='x', pady=5)
         ttk.Button(ctrl_frame, text="Запустити симуляцію", command=self.run_simulation).pack(fill='x', pady=5)
-        
+
         ttk.Label(ctrl_frame, text="* Клікніть на мапі,\nщоб переставити Gateway", foreground="blue").pack(pady=10)
 
         self.fig, self.ax = plt.subplots(figsize=(5, 5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect('button_press_event', self.on_click)
-        self.generate_nodes()
 
     def on_click(self, event):
         if event.xdata is not None and event.ydata is not None:
             self.gateway_pos = np.array([event.xdata, event.ydata])
             self.draw_network()
-
+    
+    def is_point_in_obstacle(self, x, y):
+        for ox, oy, ow, oh in self.obstacles:
+            if ox <= x <= ox + ow and oy <= y <= oy + oh:
+                return True
+        return False
+    
     def generate_nodes(self):
         size = self.field_size.get()
-        count = self.nodes_count.get()
+        target_count = self.nodes_count.get()
+        valid_nodes = []
 
-        # Генерація випадкових координат
-        self.nodes = np.random.uniform(-size/2, size/2, (count, 2))
+        max_attempts = target_count * 100
+        attempts = 0
+        
+        while len(valid_nodes) < target_count and attempts < max_attempts:
+            attempts += 1
+            x = random.uniform(-size/2, size/2)
+            y = random.uniform(-size/2, size/2)
+            
+            if not self.is_point_in_obstacle(x, y):
+                valid_nodes.append([x, y])
+        
+        self.nodes = np.array(valid_nodes)
+        
+        if len(self.nodes) < target_count:
+            print(f"Попередження: вдалося розмістити лише {len(self.nodes)} вузлів через щільність перешкод.")
+            
         self.draw_network()
 
     def draw_network(self):
         self.ax.clear()
-        # Малюємо перешкоди
-        for obs in self.obstacles:
-            rect = Rectangle((obs[0], obs[1]), obs[2], obs[3], color='red', alpha=0.3, label='Перешкода')
-            self.ax.add_patch(rect)
+        for x, y, w, h in self.obstacles:
+            self.ax.add_patch(Rectangle((x, y), w, h, color='red', alpha=0.3))
         
         self.ax.scatter(self.nodes[:,0], self.nodes[:,1], c='gray', alpha=0.5, label='Вузли')
         self.ax.scatter(self.gateway_pos[0], self.gateway_pos[1], c='gold', s=200, marker='*', edgecolors='black', label='Gateway')
@@ -192,33 +281,51 @@ class LoRaMeshSim:
         i_tx_active = self.tx_currents.get(self.current_tx_power, 0.087)
         i_rx_active = self.i_rx_lna_on
 
-        e_tx_packet = self.v_supply * i_tx_active * t_packet  # Енергія на 1 передачу (Дж)
-        e_rx_packet = self.v_supply * i_rx_active * t_packet  # Енергія на 1 прийом (Дж)
+        if self.unit_mode.get() == "Joules":
+            # Енергія в Джоулях: E = U * I * t
+            unit_tx = self.v_supply * i_tx_active * t_packet
+            unit_rx = self.v_supply * i_rx_active * t_packet
+            unit_name = "Дж"
+            display_mult = 1000 # для мДж
+            display_name = "мДж"
+        else:
+            # Заряд в Ампер-годинах: Q = (I * t) / 3600
+            # множимо на 1000 для переведення в mAh
+            unit_tx = (i_tx_active * t_packet * 1000) / 3600
+            unit_rx = (i_rx_active * t_packet * 1000) / 3600
+            unit_name = "mAh"
+            display_mult = 1 # залишаємо в mAh
+            display_name = "mAh"
         
         # Симуляція трафіку, навантаження та енергоспоживання
-        energy = np.zeros(n) # Енергоспоживання на кожному вузлі
+        mesh_energy = np.zeros(n) # Енергоспоживання на кожному вузлі MESH
+        star_energy = np.zeros(n) # Енергоспоживання на кожному вузлі STAR
         load = np.zeros(n) # Кількість оброблених пакетів на кожному вузлі
         total_packets = (n - 1) * self.packets_per_node # Сумарна к-ть згенерованих пакетів
         mesh_success_packets = 0
         
         for node_idx in range(1, n):
+            star_energy[node_idx] = self.packets_per_node * unit_tx
+            mesh_energy[node_idx] += self.packets_per_node * unit_tx
+            
             can_reach_gateway = hops[node_idx] != -1
             if can_reach_gateway:
                 mesh_success_packets += self.packets_per_node
                 curr = node_idx
-                energy[curr] += self.packets_per_node * e_tx_packet
                 load[curr] += self.packets_per_node
                 p = parent[curr]
                 while p != 0: # Поки не дійшли до Gateway
                     # Ретранслятор спочатку приймає, потім передає
-                    energy[p] += self.packets_per_node * (e_rx_packet + e_tx_packet)
+                    mesh_energy[p] += self.packets_per_node * (unit_rx + unit_tx)
                     load[p] += self.packets_per_node
                     curr = p
                     p = parent[curr]
+            else:
+                pass
+        
+        self.show_results(hops, r, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj)
 
-        self.show_results(hops, r, star_success_packets, mesh_success_packets, total_packets, energy, load, parent, adj)
-
-    def show_results(self, hops, r, star_success_packets, mesh_success_packets, total_packets, energy, load, parent, adj):
+    def show_results(self, hops, r, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj):
         res_win = tk.Toplevel(self.root)
         res_win.title("Результати роботи мережі LoRa Star vs LoRa Mesh (SX1276)")
         
@@ -230,14 +337,20 @@ class LoRaMeshSim:
         top_relay_indices = np.argsort(relay_loads)[-3:][::-1] + 1 
         
         # Розрахунок середньої енергії
-        avg_energy = np.mean(energy[1:]) if len(energy) > 1 else 0
-        total_energy = np.sum(energy[1:])
-        max_energy = np.max(energy[1:]) if len(energy) > 1 else 1
+        avg_mesh_energy = np.mean(mesh_energy[1:]) if len(mesh_energy) > 1 else 0
+        total_mesh_energy = np.sum(mesh_energy[1:])
+
+        avg_star_energy = np.mean(star_energy[1:]) if len(star_energy) > 1 else 0
+        total_star_energy = np.sum(star_energy[1:])
 
         # 1. Інтерфейс: Ліва панель
         info_frame = ttk.Frame(res_win)
         info_frame.pack(side=tk.LEFT, fill=tk.Y, padx=20, pady=20)
-
+        
+        unit_label = "Дж" if self.unit_mode.get() == "Joules" else "mAh"
+        sub_unit_label = "мДж" if self.unit_mode.get() == "Joules" else "mAh"
+        mult = 1000 if self.unit_mode.get() == "Joules" else 1
+        
         results_text = f"""
 === МЕТРИКИ ЕФЕКТИВНОСТІ ===
 
@@ -247,12 +360,15 @@ PDR (Доставка пакетів):
 
 ПЕРЕВАГА MESH: {mesh_pdr - star_pdr:.1f}%
 
-=== ЕНЕРГЕТИЧНІ ЗАТРАТИ SX1276 (3.3V) ===
+=== ЕНЕРГОСПОЖИВАННЯ SX1276 ({unit_label}) ===
+Загальне:
+• Star (LoRaWAN): {total_star_energy:.4f} {unit_label}
+• Mesh (LoRa):    {total_mesh_energy:.4f} {unit_label}
+Середнє на вузол:
+• Star (LoRaWAN): {avg_star_energy * mult:.3f} {sub_unit_label}
+• Mesh (LoRa):    {avg_mesh_energy * mult:.3f} {sub_unit_label}
 
-Загальна витрачена енергія: {total_energy:.3f} Дж
-Середня витрачена енергія 1 вузлом: {avg_energy*1000:.2f} мДж
-
-Критичні вузли (Top Load):
+Критичні вузли (для Mesh мережі):
 1. Вузол #{top_relay_indices[0]}: {int(load[top_relay_indices[0]])} пак.
 2. Вузол #{top_relay_indices[1]}: {int(load[top_relay_indices[1]])} пак.
 3. Вузол #{top_relay_indices[2]}: {int(load[top_relay_indices[2]])} пак.
@@ -290,6 +406,7 @@ PDR (Доставка пакетів):
                 #             [all_pts[i,1], all_pts[j,1]], 
                 #             color='gray', linestyle='--', alpha=0.3, lw=1, zorder=2)
         
+        max_energy = np.max(mesh_energy[1:]) if len(mesh_energy) > 1 else 1
         # Малюємо вузли: Синій - Star ok, Зелений - Mesh ok, Червоний - Dead
         for i in range(1, len(all_pts)):
             has_direct_link = (adj[0, i] == 1)
@@ -305,14 +422,14 @@ PDR (Доставка пакетів):
                 color = '#e74c3c'
                 label_type = "No Signal"
             
-            relative_energy = energy[i] / max_energy
+            relative_energy = mesh_energy[i] / max_energy
             node_size = 60 + (relative_energy * 400)
 
             ax_res.scatter(all_pts[i,0], all_pts[i,1], c=color, s=node_size, edgecolors='black', alpha=0.7, zorder=3)
             
             # Додаємо підпис енергії для найбільш навантажених
-            if energy[i] > avg_energy * 1.5:
-                ax_res.text(all_pts[i,0], all_pts[i,1]-0.3, f"Node #{i+1} \n({energy[i]*1000:.2f} mJ)", 
+            if mesh_energy[i] > avg_mesh_energy * 1.5:
+                ax_res.text(all_pts[i,0], all_pts[i,1]-0.3, f"Node #{i+1} \n({mesh_energy[i]*mult:.2f} {sub_unit_label})", 
                             fontsize=8, ha='center', color='#2c3e50', weight='bold')
 
             if i in top_relay_indices:
