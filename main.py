@@ -186,7 +186,11 @@ class LoRaMeshSim:
         ttk.Button(ctrl_frame, text="Очистити перешкоди", command=self.clear_obstacles).pack(fill='x', pady=2)
         ttk.Button(ctrl_frame, text="Генерувати вузли", command=self.generate_nodes).pack(fill='x', pady=5)
         ttk.Button(ctrl_frame, text="Запустити симуляцію", command=self.run_simulation).pack(fill='x', pady=5)
-
+        
+        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=5)
+        ttk.Button(ctrl_frame, text="Запустити серію (100 тестів)", 
+                   command=lambda: self.run_batch_simulation(100)).pack(fill='x', pady=5)
+        
         ttk.Label(ctrl_frame, text="* Клікніть на мапі,\nщоб переставити Gateway", foreground="blue").pack(pady=10)
 
         self.fig, self.ax = plt.subplots(figsize=(5, 5))
@@ -329,7 +333,85 @@ class LoRaMeshSim:
         nodes_mesh = sum(1 for i in range(1, n) if hops[i] != -1)
 
         self.show_results(hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj)
+    
+    def run_batch_simulation(self, iterations=100):
+        batch_results = {
+            'star_pdr': [], 'mesh_pdr': [],
+            'star_energy': [], 'mesh_energy': [],
+            'coverage_star': [], 'coverage_mesh': []
+        }
 
+        for _ in range(iterations):
+            self.generate_obstacles()
+            self.generate_nodes()
+            
+            r = self.r_max.get()
+            all_pts = np.vstack([self.gateway_pos, self.nodes])
+            n = len(all_pts)
+            
+            adj = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i+1, n):
+                    dist = np.linalg.norm(all_pts[i] - all_pts[j])
+                    if dist <= r and not self.is_blocked(all_pts[i], all_pts[j]):
+                        adj[i,j] = adj[j,i] = 1
+
+            hops = np.full(n, -1)
+            parent = np.full(n, -1)
+            hops[0] = 0
+            q = deque([0])
+            while q:
+                u = q.popleft()
+                for v, conn in enumerate(adj[u]):
+                    if conn and hops[v] == -1:
+                        hops[v] = hops[u] + 1
+                        parent[v] = u
+                        q.append(v)
+
+            # Розрахунок метрик
+            total_pkts = (n - 1) * self.packets_per_node
+            s_pkts = sum(self.packets_per_node for i in range(1, n) 
+                         if np.linalg.norm(all_pts[i] - self.gateway_pos) <= r 
+                         and not self.is_blocked(all_pts[i], self.gateway_pos))
+            m_pkts = sum(self.packets_per_node for i in range(1, n) if hops[i] != -1)
+
+            t_packet = self.calculate_toa()
+            unit_tx = (self.tx_currents[self.current_tx_power] * t_packet * 1000) / 3600 # mAh
+            unit_rx = (self.i_rx_lna_on * t_packet * 1000) / 3600 # mAh
+
+            m_energy = np.zeros(n)
+            for i in range(1, n):
+                if hops[i] != -1:
+                    m_energy[i] += self.packets_per_node * unit_tx
+                    p = parent[i]
+                    while p != 0:
+                        m_energy[p] += self.packets_per_node * (unit_rx + unit_tx)
+                        p = parent[p]
+
+            batch_results['star_pdr'].append((s_pkts / total_pkts) * 100)
+            batch_results['mesh_pdr'].append((m_pkts / total_pkts) * 100)
+            batch_results['star_energy'].append((n-1) * self.packets_per_node * unit_tx)
+            batch_results['mesh_energy'].append(np.sum(m_energy))
+            batch_results['coverage_star'].append(sum(1 for i in range(1, n) if adj[0,i]==1))
+            batch_results['coverage_mesh'].append(sum(1 for i in range(1, n) if hops[i]!=-1))
+
+        avg_text = f"""
+РЕЗУЛЬТАТИ СЕРІЇ З {iterations} ТЕСТІВ
+-------------------------------------------
+Середній PDR Star: {np.mean(batch_results['star_pdr']):.2f}%
+Середній PDR Mesh: {np.mean(batch_results['mesh_pdr']):.2f}%
+ПЕРЕВАГА MESH ЗА PDR: {np.mean(batch_results['mesh_pdr']) - np.mean(batch_results['star_pdr']):.2f}%
+
+Сер. покриття Star: {np.mean(batch_results['coverage_star']):.1f} вузлів
+Сер. покриття Mesh: {np.mean(batch_results['coverage_mesh']):.1f} вузлів
+
+Загальна енергія Star (сер.): {np.mean(batch_results['star_energy']):.4f} mAh
+Загальна енергія Mesh (сер.): {np.mean(batch_results['mesh_energy']):.4f} mAh
+-------------------------------------------
+"""
+        print(avg_text)
+        tk.messagebox.showinfo("Результати серії тестів", avg_text)
+    
     def show_results(self, hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj):
         res_win = tk.Toplevel(self.root)
         res_win.title("Результати роботи мережі LoRa Star vs LoRa Mesh (SX1276)")
@@ -442,11 +524,11 @@ PDR (Доставка пакетів):
             
             # Додаємо підпис енергії для найбільш навантажених
             if mesh_energy[i] > avg_mesh_energy * 1.5:
-                ax_res.text(all_pts[i,0], all_pts[i,1]-0.3, f"Node #{i+1} \n({mesh_energy[i]*mult:.2f} {sub_unit_label})", 
+                ax_res.text(all_pts[i,0], all_pts[i,1]-0.5, f"Node #{i+1} \n({mesh_energy[i]*mult:.2f} {sub_unit_label})", 
                             fontsize=8, ha='center', color='#2c3e50', weight='bold')
 
             if i in top_relay_indices:
-                ax_res.text(all_pts[i,0], all_pts[i,1]+0.15, "CRITICAL", 
+                ax_res.text(all_pts[i,0], all_pts[i,1]+0.2, "CRITICAL", 
                             color='darkred', weight='bold', fontsize=8, ha='center')
 
         # Gateway
