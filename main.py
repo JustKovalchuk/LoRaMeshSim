@@ -323,9 +323,14 @@ class LoRaMeshSim:
             else:
                 pass
         
-        self.show_results(hops, r, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj)
+        # Кількість підключених вузлів у Star (пряма видимість)
+        nodes_star = sum(1 for i in range(1, n) if adj[0, i] == 1)
+        # Кількість підключених вузлів у Mesh (через BFS)
+        nodes_mesh = sum(1 for i in range(1, n) if hops[i] != -1)
 
-    def show_results(self, hops, r, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj):
+        self.show_results(hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj)
+
+    def show_results(self, hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj):
         res_win = tk.Toplevel(self.root)
         res_win.title("Результати роботи мережі LoRa Star vs LoRa Mesh (SX1276)")
         
@@ -351,6 +356,10 @@ class LoRaMeshSim:
         sub_unit_label = "мДж" if self.unit_mode.get() == "Joules" else "mAh"
         mult = 1000 if self.unit_mode.get() == "Joules" else 1
         
+        # Розрахунок розширення покриття
+        coverage_star = (nodes_star / len(self.nodes)) * 100
+        coverage_mesh = (nodes_mesh / len(self.nodes)) * 100
+
         results_text = f"""
 === МЕТРИКИ ЕФЕКТИВНОСТІ ===
 
@@ -360,13 +369,17 @@ PDR (Доставка пакетів):
 
 ПЕРЕВАГА MESH: {mesh_pdr - star_pdr:.1f}%
 
-=== ЕНЕРГОСПОЖИВАННЯ SX1276 ({unit_label}) ===
+ЕНЕРГОСПОЖИВАННЯ SX1276 ({unit_label})
 Загальне:
 • Star (LoRaWAN): {total_star_energy:.4f} {unit_label}
 • Mesh (LoRa):    {total_mesh_energy:.4f} {unit_label}
 Середнє на вузол:
 • Star (LoRaWAN): {avg_star_energy * mult:.3f} {sub_unit_label}
 • Mesh (LoRa):    {avg_mesh_energy * mult:.3f} {sub_unit_label}
+
+Покриття вузлів:
+• Star (LoRaWAN): {nodes_star}/{len(self.nodes)} вузлів
+• Mesh (LoRa):    {nodes_mesh}/{len(self.nodes)} вузлів
 
 Критичні вузли (для Mesh мережі):
 1. Вузол #{top_relay_indices[0]}: {int(load[top_relay_indices[0]])} пак.
