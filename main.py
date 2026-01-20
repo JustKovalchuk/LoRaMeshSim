@@ -342,9 +342,11 @@ class LoRaMeshSim:
         }
 
         for _ in range(iterations):
+            # 1. Генерація нових випадкових даних для кожного тесту
             self.generate_obstacles()
             self.generate_nodes()
             
+            # 2. Розрахунок параметрів (копія логіки з run_simulation, але без UI)
             r = self.r_max.get()
             all_pts = np.vstack([self.gateway_pos, self.nodes])
             n = len(all_pts)
@@ -388,6 +390,7 @@ class LoRaMeshSim:
                         m_energy[p] += self.packets_per_node * (unit_rx + unit_tx)
                         p = parent[p]
 
+            # Збір даних
             batch_results['star_pdr'].append((s_pkts / total_pkts) * 100)
             batch_results['mesh_pdr'].append((m_pkts / total_pkts) * 100)
             batch_results['star_energy'].append((n-1) * self.packets_per_node * unit_tx)
@@ -395,6 +398,7 @@ class LoRaMeshSim:
             batch_results['coverage_star'].append(sum(1 for i in range(1, n) if adj[0,i]==1))
             batch_results['coverage_mesh'].append(sum(1 for i in range(1, n) if hops[i]!=-1))
 
+        # Вивід усереднених результатів
         avg_text = f"""
 РЕЗУЛЬТАТИ СЕРІЇ З {iterations} ТЕСТІВ
 -------------------------------------------
