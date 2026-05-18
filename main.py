@@ -1,12 +1,15 @@
+import math
 import tkinter as tk
-from tkinter import ttk
-import numpy as np
+from tkinter import messagebox, ttk
+
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
-from collections import deque
-import math
-import random
+
+from scene_builder import SceneBuilder, SceneConfig
+from simulation_core import LoRaSimulationEngine, SimulationConfig
+
 
 class LoRaMeshSim:
     def __init__(self, root):
@@ -23,140 +26,158 @@ class LoRaMeshSim:
             7:  0.020    # +7 dBm (RFO)
         }
         self.current_tx_power = 17
-        self.i_rx_lna_on = 0.0115  # LnaBoost On (типово для стабільного зв'язку)
-        self.i_rx_lna_off = 0.0108 # LnaBoost Off
+        self.i_rx_lna_on = 0.0115
 
-        # Параметри протоколу
-        self.sf = 7               # Spreading Factor
-        self.bw = 125000          # Bandwidth (Гц)
-        self.cr = 1               # Coding Rate (1=4/5)
-        self.payload_len = 20     # Розмір повідомлення (байтів)
-        self.preamble_len = 8     # Довжина преамбули
+        # LoRa PHY
+        self.sf = 9
+        self.bw = 125000
+        self.cr = 1
+        self.payload_len = 20
+        self.preamble_len = 8
+        self.receiver_sensitivity_dbm = -137.0
+        self.snr_threshold_db = -7.5
+        self.capture_threshold_db = 6.0
 
-        # Налаштування поля та вузлів
+        # Радіоканал
+        self.l0_db = 40.0
+        self.path_loss_exp = 2.8
+
+        # Параметри симуляції
         self.unit_mode = tk.StringVar(value="Joules")
         self.nodes_count = tk.IntVar(value=30)
         self.obstacles_count = tk.IntVar(value=4)
-        self.r_max = tk.DoubleVar(value=2.0)
         self.field_size = tk.DoubleVar(value=6.0)
-        self.packets_per_node = 100
+        self.r_max = tk.DoubleVar(value=2.0)
+        self.mobility_speed = tk.DoubleVar(value=0.03)
+        self.mobility_step_s = tk.DoubleVar(value=1.0)
+        self.routing_update_s = tk.DoubleVar(value=3.0)
+        self.packet_interval_s = tk.DoubleVar(value=2.0)
+        self.max_retries = tk.IntVar(value=2)
+        self.packets_per_node = tk.IntVar(value=30)
+        self.scenario = tk.StringVar(value="ideal")
+        self.link_model = tk.StringVar(value="realistic")
+        self.routing_model = tk.StringVar(value="balanced")
+        self.obstacle_profile = tk.StringVar(value="mixed")
+        self.node_profile = tk.StringVar(value="uniform")
+
         self.gateway_pos = np.array([0.0, 0.0])
         self.nodes = None
         self.obstacles = []
-        
+        self.last_metrics = None
+        self.scene_builder = SceneBuilder(self.gateway_pos)
+
         self.setup_ui()
         self.generate_obstacles()
         self.generate_nodes()
 
     def calculate_toa(self, crc_enabled=True, implicit_header=False):
-        t_symbol = (2**self.sf) / self.bw
-        de = 1 if (t_symbol > 0.016) else 0 # Low Data Rate Optimization
+        t_symbol = (2 ** self.sf) / self.bw
+        de = 1 if t_symbol > 0.016 else 0
         ih = 1 if implicit_header else 0
         crc = 1 if crc_enabled else 0
-
         payload_symb_nb = 8 + max(
-            math.ceil(
-                (8 * self.payload_len - 4 * self.sf + 28 + 16 * crc - 20 * ih) / 
-                (4 * (self.sf - 2 * de))
-            ) * (self.cr + 4), 0
+            math.ceil((8 * self.payload_len - 4 * self.sf + 28 + 16 * crc - 20 * ih) / (4 * (self.sf - 2 * de))) * (self.cr + 4),
+            0,
         )
-        t_preamble = (self.preamble_len + 4.25) * t_symbol
-        t_payload = payload_symb_nb * t_symbol
-        return t_preamble + t_payload
-    
-    def line_intersects_rect(self, p1, p2, rect):
-        """Перевірка чи перетинає відрізок p1-p2 прямокутник rect (x, y, w, h)"""
-        x, y, w, h = rect
-        # Грані прямокутника
-        rect_lines = [
-            ((x, y), (x + w, y)),
-            ((x + w, y), (x + w, y + h)),
-            ((x + w, y + h), (x, y + h)),
-            ((x, y + h), (x, y))
-        ]
-        
-        for r_p1, r_p2 in rect_lines:
-            if self.segments_intersect(p1, p2, r_p1, r_p2):
-                return True
-        return False
-    
+        return (self.preamble_len + 4.25) * t_symbol + payload_symb_nb * t_symbol
+
+    def build_config(self):
+        return SimulationConfig(
+            v_supply=self.v_supply,
+            tx_currents=self.tx_currents,
+            current_tx_power=self.current_tx_power,
+            i_rx_lna_on=self.i_rx_lna_on,
+            sf=self.sf,
+            bw=self.bw,
+            cr=self.cr,
+            payload_len=self.payload_len,
+            preamble_len=self.preamble_len,
+            receiver_sensitivity_dbm=self.receiver_sensitivity_dbm,
+            snr_threshold_db=self.snr_threshold_db,
+            capture_threshold_db=self.capture_threshold_db,
+            l0_db=self.l0_db,
+            path_loss_exp=self.path_loss_exp,
+            distance_radius_km=self.r_max.get(),
+            link_model=self.link_model.get(),
+            routing_model=self.routing_model.get(),
+            packet_interval_s=max(0.1, self.packet_interval_s.get()),
+            packets_per_node=self.packets_per_node.get(),
+            max_retries=self.max_retries.get(),
+            mobility_speed=self.mobility_speed.get(),
+            mobility_step_s=self.mobility_step_s.get(),
+            routing_update_s=self.routing_update_s.get(),
+            field_size=self.field_size.get(),
+            unit_mode=self.unit_mode.get(),
+        )
+
+    def create_engine(self):
+        return LoRaSimulationEngine(
+            config=self.build_config(),
+            gateway_pos=self.gateway_pos,
+            nodes=self.nodes,
+            is_blocked_cb=self.scene_builder.is_blocked,
+            is_point_in_obstacle_cb=self.scene_builder.is_point_in_obstacle,
+        )
+
+    def build_scene_config(self):
+        return SceneConfig(
+            field_size=self.field_size.get(),
+            obstacles_count=self.obstacles_count.get(),
+            nodes_count=self.nodes_count.get(),
+            obstacle_profile=self.obstacle_profile.get(),
+            node_profile=self.node_profile.get(),
+        )
+
     def generate_obstacles(self):
-        """Генерує випадкові прямокутні перешкоди"""
-        self.obstacles = []
-        size = self.field_size.get()
-        target_count = self.obstacles_count.get()
+        self.scene_builder.update_gateway(self.gateway_pos)
+        self.obstacles = self.scene_builder.generate_obstacles(self.build_scene_config())
 
-        # Функція для перевірки перетину двох прямокутників
-        def rects_overlap(r1, r2):
-            # r = (x, y, w, h)
-            return not (r1[0] + r1[2] < r2[0] or 
-                        r1[0] > r2[0] + r2[2] or 
-                        r1[1] + r1[3] < r2[1] or 
-                        r1[1] > r2[1] + r2[3])
-        
-        max_attempts = 1000
-        attempts = 0
-
-        while len(self.obstacles) < target_count and attempts < max_attempts:
-            attempts += 1
-            # Випадково обираємо тип: 0 - будинок (квадратний), 1 - стіна (довга)
-            obs_type = random.randint(0, 1)
-            
-            if obs_type == 0:
-                w = random.uniform(size * 0.05, size * 0.1)
-                h = random.uniform(size * 0.05, size * 0.1)
-            else:
-                if random.random() > 0.5:
-                    w = random.uniform(size * 0.1, size * 0.4)
-                    h = random.uniform(0.05, 0.05)
-                else:
-                    w = random.uniform(0.05, 0.05)
-                    h = random.uniform(size * 0.1, size * 0.4)
-
-            x = random.uniform(-size/2, size/2 - w)
-            y = random.uniform(-size/2, size/2 - h)
-            new_rect = (x, y, w, h)
-            
-            margin = 0.3
-            gw_rect = (self.gateway_pos[0] - margin, self.gateway_pos[1] - margin, margin*2, margin*2)
-            if rects_overlap(new_rect, gw_rect):
-                continue
-            
-            gap = 0.1
-            collision = False
-            for obs in self.obstacles:
-                if rects_overlap((x-gap, y-gap, w+gap*2, h+gap*2), obs):
-                    collision = True
-                    break
-            
-            if not collision:
-                self.obstacles.append(new_rect)
-        
-        if self.nodes is not None:
+        if self.nodes is not None and len(self.nodes) > 0:
             self.draw_network()
 
     def clear_obstacles(self):
         self.obstacles = []
-        
+        self.scene_builder.obstacles = []
         self.obstacles_count.set(0)
-        self.draw_network()
-    
-    def segments_intersect(self, a, b, c, d):
-        """Перевірка перетину двох відрізків AB та CD"""
-        def ccw(A, B, C):
-            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-        return ccw(a,c,d) != ccw(b,c,d) and ccw(a,b,c) != ccw(a,b,d)
-
-    def is_blocked(self, p1, p2):
-        """Перевірка чи заблокований шлях будь-якою перешкодою"""
-        for obs in self.obstacles:
-            if self.line_intersects_rect(p1, p2, obs):
-                return True
-        return False
+        if self.nodes is not None and len(self.nodes) > 0:
+            self.draw_network()
 
     def setup_ui(self):
-        ctrl_frame = ttk.LabelFrame(self.root, text="Параметри симуляції (LoRa SX1276)")
-        ctrl_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        sidebar = ttk.Frame(self.root)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0), pady=10)
+
+        self.ctrl_canvas = tk.Canvas(sidebar, width=360, highlightthickness=0)
+        self.ctrl_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+
+        scrollbar = ttk.Scrollbar(sidebar, orient=tk.VERTICAL, command=self.ctrl_canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ctrl_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollable = ttk.Frame(self.ctrl_canvas)
+        canvas_window = self.ctrl_canvas.create_window((0, 0), window=scrollable, anchor="nw")
+
+        def on_scrollable_configure(_event):
+            self.ctrl_canvas.configure(scrollregion=self.ctrl_canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            self.ctrl_canvas.itemconfigure(canvas_window, width=event.width)
+
+        def on_mousewheel(event):
+            self.ctrl_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def bind_wheel(_event):
+            self.ctrl_canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        def unbind_wheel(_event):
+            self.ctrl_canvas.unbind_all("<MouseWheel>")
+
+        scrollable.bind("<Configure>", on_scrollable_configure)
+        self.ctrl_canvas.bind("<Configure>", on_canvas_configure)
+        self.ctrl_canvas.bind("<Enter>", bind_wheel)
+        self.ctrl_canvas.bind("<Leave>", unbind_wheel)
+
+        ctrl_frame = ttk.LabelFrame(scrollable, text="Параметри симуляції (LoRa SX1276 + SimPy)")
+        ctrl_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         ttk.Label(ctrl_frame, text="Кількість перешкод:").pack()
         ttk.Entry(ctrl_frame, textvariable=self.obstacles_count).pack(pady=2)
@@ -164,296 +185,313 @@ class LoRaMeshSim:
         ttk.Label(ctrl_frame, text="Кількість вузлів:").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.nodes_count).pack()
 
-        ttk.Label(ctrl_frame, text="Радіус зв'язку R_max (км):").pack(pady=5)
-        ttk.Entry(ctrl_frame, textvariable=self.r_max).pack()
-
         ttk.Label(ctrl_frame, text="Розмір поля (км):").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.field_size).pack()
 
-        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Label(ctrl_frame, text="R_max для режиму 'distance' (км):").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.r_max).pack()
 
-        ttk.Label(ctrl_frame, text="Одиниці вимірювання енергії:").pack(pady=5)
+        ttk.Label(ctrl_frame, text="Пакетів на вузол:").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.packets_per_node).pack()
+
+        ttk.Label(ctrl_frame, text="Інтервал трафіку (с):").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.packet_interval_s).pack()
+
+        ttk.Label(ctrl_frame, text="Швидкість руху (км/с):").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.mobility_speed).pack()
+
+        ttk.Label(ctrl_frame, text="Оновлення маршруту (с):").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.routing_update_s).pack()
+
+        ttk.Label(ctrl_frame, text="Ретраї (без ACK):").pack(pady=5)
+        ttk.Entry(ctrl_frame, textvariable=self.max_retries).pack()
+
+        ttk.Label(ctrl_frame, text="Сценарій середовища:").pack(pady=5)
+        ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.scenario,
+            values=("ideal", "noisy", "dense"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(ctrl_frame, text="Модель доставки:").pack(pady=5)
+        ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.link_model,
+            values=("realistic", "distance"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(ctrl_frame, text="Модель маршрутизації (Mesh):").pack(pady=5)
+        ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.routing_model,
+            values=("balanced", "min_hops", "distance_first"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(ctrl_frame, text="Тип перешкод:").pack(pady=5)
+        ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.obstacle_profile,
+            values=("mixed", "buildings", "walls"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(ctrl_frame, text="Тип розміщення нод:").pack(pady=5)
+        ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.node_profile,
+            values=("uniform", "clustered"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=10)
+
+        ttk.Label(ctrl_frame, text="Одиниці енергії:").pack(pady=5)
         ttk.Radiobutton(ctrl_frame, text="Джоулі (J/mJ)", variable=self.unit_mode, value="Joules").pack(anchor=tk.W)
         ttk.Radiobutton(ctrl_frame, text="Ампер-години (mAh)", variable=self.unit_mode, value="mAh").pack(anchor=tk.W)
-        
-        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
 
-        toa = self.calculate_toa() * 1000 # в мс
-        ttk.Label(ctrl_frame, text=f"SF: {self.sf} | BW: {self.bw/1000}kHz", foreground="darkgreen").pack()
-        ttk.Label(ctrl_frame, text=f"Packet ToA: {toa:.2f} ms").pack()
-        
-        ttk.Button(ctrl_frame, text="Генерувати перешкоди", command=self.generate_obstacles).pack(fill='x', pady=5)
-        ttk.Button(ctrl_frame, text="Очистити перешкоди", command=self.clear_obstacles).pack(fill='x', pady=2)
-        ttk.Button(ctrl_frame, text="Генерувати вузли", command=self.generate_nodes).pack(fill='x', pady=5)
-        ttk.Button(ctrl_frame, text="Запустити симуляцію", command=self.run_simulation).pack(fill='x', pady=5)
-        
-        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=5)
-        ttk.Button(ctrl_frame, text="Запустити серію (100 тестів)", 
-                   command=lambda: self.run_batch_simulation(100)).pack(fill='x', pady=5)
-        
-        ttk.Label(ctrl_frame, text="* Клікніть на мапі,\nщоб переставити Gateway", foreground="blue").pack(pady=10)
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=10)
+        toa_ms = self.calculate_toa() * 1000
+        ttk.Label(ctrl_frame, text=f"SF: {self.sf} | BW: {self.bw / 1000:.0f} kHz", foreground="darkgreen").pack()
+        ttk.Label(ctrl_frame, text=f"ToA: {toa_ms:.2f} ms | Capture: {self.capture_threshold_db:.1f} dB").pack()
+        ttk.Label(ctrl_frame, text=f"Sensitivity: {self.receiver_sensitivity_dbm:.1f} dBm").pack()
+
+        ttk.Button(ctrl_frame, text="Генерувати перешкоди", command=self.generate_obstacles).pack(fill="x", pady=5)
+        ttk.Button(ctrl_frame, text="Очистити перешкоди", command=self.clear_obstacles).pack(fill="x", pady=2)
+        ttk.Button(ctrl_frame, text="Генерувати вузли", command=self.generate_nodes).pack(fill="x", pady=5)
+        ttk.Button(ctrl_frame, text="Запустити симуляцію", command=self.run_simulation).pack(fill="x", pady=5)
+        ttk.Button(ctrl_frame, text="Покрокова візуалізація (Mesh)", command=self.run_step_visualization).pack(fill="x", pady=2)
+
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Button(
+            ctrl_frame,
+            text="Запустити серію (3 сценарії × 30)",
+            command=lambda: self.run_batch_simulation(30),
+        ).pack(fill="x", pady=5)
+
+        ttk.Label(ctrl_frame, text="* Клік по мапі змінює Gateway", foreground="blue").pack(pady=10)
 
         self.fig, self.ax = plt.subplots(figsize=(5, 5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        self.canvas.mpl_connect('button_press_event', self.on_click)
+        self.canvas.mpl_connect("button_press_event", self.on_click)
 
     def on_click(self, event):
         if event.xdata is not None and event.ydata is not None:
             self.gateway_pos = np.array([event.xdata, event.ydata])
+            self.scene_builder.update_gateway(self.gateway_pos)
             self.draw_network()
-    
-    def is_point_in_obstacle(self, x, y):
-        for ox, oy, ow, oh in self.obstacles:
-            if ox <= x <= ox + ow and oy <= y <= oy + oh:
-                return True
-        return False
-    
-    def generate_nodes(self):
-        size = self.field_size.get()
-        target_count = self.nodes_count.get()
-        valid_nodes = []
 
-        max_attempts = target_count * 100
-        attempts = 0
-        
-        while len(valid_nodes) < target_count and attempts < max_attempts:
-            attempts += 1
-            x = random.uniform(-size/2, size/2)
-            y = random.uniform(-size/2, size/2)
-            
-            if not self.is_point_in_obstacle(x, y):
-                valid_nodes.append([x, y])
-        
-        self.nodes = np.array(valid_nodes)
-        
+    def generate_nodes(self):
+        target_count = self.nodes_count.get()
+        self.nodes = self.scene_builder.generate_nodes(self.build_scene_config())
         if len(self.nodes) < target_count:
             print(f"Попередження: вдалося розмістити лише {len(self.nodes)} вузлів через щільність перешкод.")
-            
         self.draw_network()
 
     def draw_network(self):
         self.ax.clear()
         for x, y, w, h in self.obstacles:
-            self.ax.add_patch(Rectangle((x, y), w, h, color='red', alpha=0.3))
-        
-        self.ax.scatter(self.nodes[:,0], self.nodes[:,1], c='gray', alpha=0.5, label='Вузли')
-        self.ax.scatter(self.gateway_pos[0], self.gateway_pos[1], c='gold', s=200, marker='*', edgecolors='black', label='Gateway')
+            self.ax.add_patch(Rectangle((x, y), w, h, color="red", alpha=0.3))
+        if self.nodes is not None and len(self.nodes) > 0:
+            self.ax.scatter(self.nodes[:, 0], self.nodes[:, 1], c="gray", alpha=0.5, label="Вузли")
+        self.ax.scatter(self.gateway_pos[0], self.gateway_pos[1], c="gold", s=200, marker="*", edgecolors="black", label="Gateway")
         self.ax.set_title("Попередній перегляд структури мережі з перешкодами")
-        self.ax.grid(True, linestyle=':')
+        self.ax.grid(True, linestyle=":")
         self.canvas.draw()
 
     def run_simulation(self):
-        r = self.r_max.get()
-        all_pts = np.vstack([self.gateway_pos, self.nodes])
-        n = len(all_pts)
-        
-        # Матриця відстаней та суміжності (Unit Disk Graph)
-        adj = np.zeros((n, n))
-        for i in range(n):
-            for j in range(i+1, n):
-                dist = np.linalg.norm(all_pts[i] - all_pts[j])
-                if dist <= r:
-                    if not self.is_blocked(all_pts[i], all_pts[j]):
-                        adj[i,j] = adj[j,i] = 1
-        
-        # print("Матриця суміжності:\n", adj)
+        if self.nodes is None or len(self.nodes) == 0:
+            messagebox.showwarning("Помилка", "Спочатку згенеруйте вузли.")
+            return
+        engine = self.create_engine()
+        scenario_name = self.scenario.get()
+        star = engine.simulate("star", scenario_name)
+        mesh = engine.simulate("mesh", scenario_name)
+        self.last_metrics = (star, mesh, scenario_name)
+        self.show_results(star, mesh, scenario_name)
 
-        # Розрахунок мінімальної кількості хопів через BFS
-        hops = np.full(n, -1)
-        parent = np.full(n, -1)
-        hops[0] = 0
-        q = deque([0])
-        while q:
-            u = q.popleft()
-            for v, conn in enumerate(adj[u]):
-                if conn and hops[v] == -1:
-                    hops[v] = hops[u] + 1
-                    parent[v] = u
-                    q.append(v)
-        
-        # Розрахунок PDR для Star (тільки пряма видимість до GW)
-        star_success_packets = 0
-        for i in range(1, n):
-            dist = np.linalg.norm(all_pts[i] - self.gateway_pos)
-            if dist <= r and not self.is_blocked(all_pts[i], self.gateway_pos):
-                star_success_packets += self.packets_per_node
-        
-        # Розрахунок енергії
-        t_packet = self.calculate_toa()
+    def run_step_visualization(self):
+        if self.nodes is None or len(self.nodes) == 0:
+            messagebox.showwarning("Помилка", "Спочатку згенеруйте вузли.")
+            return
+        engine = self.create_engine()
+        scenario_name = self.scenario.get()
+        mesh = engine.simulate("mesh", scenario_name, collect_trace=True, max_trace_steps=700)
+        trace = mesh.get("trace", [])
+        if not trace:
+            messagebox.showwarning("Немає даних", "Не вдалося зібрати кроки для візуалізації.")
+            return
+        self.show_step_visualizer(trace, scenario_name)
 
-        i_tx_active = self.tx_currents.get(self.current_tx_power, 0.087)
-        i_rx_active = self.i_rx_lna_on
+    def show_step_visualizer(self, trace, scenario_name):
+        viewer = tk.Toplevel(self.root)
+        viewer.title("Покрокова візуалізація руху та обрахунку (Mesh)")
 
-        if self.unit_mode.get() == "Joules":
-            # Енергія в Джоулях: E = U * I * t
-            unit_tx = self.v_supply * i_tx_active * t_packet
-            unit_rx = self.v_supply * i_rx_active * t_packet
-            unit_name = "Дж"
-            display_mult = 1000 # для мДж
-            display_name = "мДж"
-        else:
-            # Заряд в Ампер-годинах: Q = (I * t) / 3600
-            # множимо на 1000 для переведення в mAh
-            unit_tx = (i_tx_active * t_packet * 1000) / 3600
-            unit_rx = (i_rx_active * t_packet * 1000) / 3600
-            unit_name = "mAh"
-            display_mult = 1 # залишаємо в mAh
-            display_name = "mAh"
-        
-        # Симуляція трафіку, навантаження та енергоспоживання
-        mesh_energy = np.zeros(n) # Енергоспоживання на кожному вузлі MESH
-        star_energy = np.zeros(n) # Енергоспоживання на кожному вузлі STAR
-        load = np.zeros(n) # Кількість оброблених пакетів на кожному вузлі
-        total_packets = (n - 1) * self.packets_per_node # Сумарна к-ть згенерованих пакетів
-        mesh_success_packets = 0
-        
-        for node_idx in range(1, n):
-            star_energy[node_idx] = self.packets_per_node * unit_tx
-            mesh_energy[node_idx] += self.packets_per_node * unit_tx
-            
-            can_reach_gateway = hops[node_idx] != -1
-            if can_reach_gateway:
-                mesh_success_packets += self.packets_per_node
-                curr = node_idx
-                load[curr] += self.packets_per_node
-                p = parent[curr]
-                while p != 0: # Поки не дійшли до Gateway
-                    # Ретранслятор спочатку приймає, потім передає
-                    mesh_energy[p] += self.packets_per_node * (unit_rx + unit_tx)
-                    load[p] += self.packets_per_node
-                    curr = p
-                    p = parent[curr]
+        control = ttk.Frame(viewer)
+        control.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
+
+        frame_idx = tk.IntVar(value=0)
+        playing = {"value": False}
+        status_var = tk.StringVar(value="")
+
+        ttk.Label(control, text=f"Сценарій: {scenario_name.upper()}").pack(side=tk.LEFT, padx=4)
+        ttk.Label(control, text="Крок:").pack(side=tk.LEFT, padx=(12, 4))
+        scale = ttk.Scale(control, from_=0, to=len(trace) - 1, orient=tk.HORIZONTAL)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        canvas = FigureCanvasTkAgg(fig, master=viewer)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        ttk.Label(viewer, textvariable=status_var, justify=tk.LEFT).pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
+
+        def render_frame(index):
+            idx = max(0, min(len(trace) - 1, int(index)))
+            frame_idx.set(idx)
+            frame = trace[idx]
+            ax.clear()
+
+            for x, y, w, h in self.obstacles:
+                ax.add_patch(Rectangle((x, y), w, h, color="red", alpha=0.35))
+
+            positions = frame["positions"]
+            parent = frame["parent"]
+
+            for i in range(1, len(positions)):
+                p = int(parent[i])
+                if p != -1:
+                    ax.plot(
+                        [positions[i, 0], positions[p, 0]],
+                        [positions[i, 1], positions[p, 1]],
+                        color="#9acd32",
+                        alpha=0.45,
+                        linewidth=1.2,
+                    )
+
+            ax.scatter(positions[1:, 0], positions[1:, 1], c="#7f8c8d", s=45, edgecolors="black", alpha=0.8)
+            ax.scatter(positions[0, 0], positions[0, 1], c="gold", s=300, marker="*", edgecolors="black", zorder=5)
+
+            details = frame.get("details", {})
+            if frame["event"] == "packet" and details:
+                note = (
+                    f"t={frame['time']:.2f}s | packet node={details.get('node_id')} "
+                    f"id={details.get('packet_id')} delivered={details.get('delivered')} "
+                    f"attempts={details.get('attempts')}"
+                )
             else:
-                pass
-        
-        # Кількість підключених вузлів у Star (пряма видимість)
-        nodes_star = sum(1 for i in range(1, n) if adj[0, i] == 1)
-        # Кількість підключених вузлів у Mesh (через BFS)
-        nodes_mesh = sum(1 for i in range(1, n) if hops[i] != -1)
+                note = f"t={frame['time']:.2f}s | event={frame['event']}"
 
-        self.show_results(hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj)
-    
-    def run_batch_simulation(self, iterations=100):
-        batch_results = {
-            'star_pdr': [], 'mesh_pdr': [],
-            'star_energy': [], 'mesh_energy': [],
-            'coverage_star': [], 'coverage_mesh': []
-        }
+            pdr = 100.0 * frame["success_packets"] / max(1, frame["total_packets"])
+            status_var.set(
+                f"{note}\nУспішно: {frame['success_packets']} / {frame['total_packets']}  (PDR {pdr:.1f}%)"
+            )
 
-        for _ in range(iterations):
-            # 1. Генерація нових випадкових даних для кожного тесту
-            self.generate_obstacles()
-            self.generate_nodes()
-            
-            # 2. Розрахунок параметрів (копія логіки з run_simulation, але без UI)
-            r = self.r_max.get()
-            all_pts = np.vstack([self.gateway_pos, self.nodes])
-            n = len(all_pts)
-            
-            adj = np.zeros((n, n))
-            for i in range(n):
-                for j in range(i+1, n):
-                    dist = np.linalg.norm(all_pts[i] - all_pts[j])
-                    if dist <= r and not self.is_blocked(all_pts[i], all_pts[j]):
-                        adj[i,j] = adj[j,i] = 1
+            ax.set_title("Mesh: покроковий стан мережі")
+            ax.set_xlabel("Відстань (км)")
+            ax.set_ylabel("Відстань (км)")
+            ax.grid(True, linestyle=":", alpha=0.5)
+            canvas.draw()
 
-            hops = np.full(n, -1)
-            parent = np.full(n, -1)
-            hops[0] = 0
-            q = deque([0])
-            while q:
-                u = q.popleft()
-                for v, conn in enumerate(adj[u]):
-                    if conn and hops[v] == -1:
-                        hops[v] = hops[u] + 1
-                        parent[v] = u
-                        q.append(v)
+        def on_scale_change(value):
+            render_frame(float(value))
 
-            # Розрахунок метрик
-            total_pkts = (n - 1) * self.packets_per_node
-            s_pkts = sum(self.packets_per_node for i in range(1, n) 
-                         if np.linalg.norm(all_pts[i] - self.gateway_pos) <= r 
-                         and not self.is_blocked(all_pts[i], self.gateway_pos))
-            m_pkts = sum(self.packets_per_node for i in range(1, n) if hops[i] != -1)
+        scale.configure(command=on_scale_change)
 
-            t_packet = self.calculate_toa()
-            unit_tx = (self.tx_currents[self.current_tx_power] * t_packet * 1000) / 3600 # mAh
-            unit_rx = (self.i_rx_lna_on * t_packet * 1000) / 3600 # mAh
+        def step_prev():
+            playing["value"] = False
+            render_frame(frame_idx.get() - 1)
+            scale.set(frame_idx.get())
 
-            m_energy = np.zeros(n)
-            for i in range(1, n):
-                if hops[i] != -1:
-                    m_energy[i] += self.packets_per_node * unit_tx
-                    p = parent[i]
-                    while p != 0:
-                        m_energy[p] += self.packets_per_node * (unit_rx + unit_tx)
-                        p = parent[p]
+        def step_next():
+            playing["value"] = False
+            render_frame(frame_idx.get() + 1)
+            scale.set(frame_idx.get())
 
-            # Збір даних
-            batch_results['star_pdr'].append((s_pkts / total_pkts) * 100)
-            batch_results['mesh_pdr'].append((m_pkts / total_pkts) * 100)
-            batch_results['star_energy'].append((n-1) * self.packets_per_node * unit_tx)
-            batch_results['mesh_energy'].append(np.sum(m_energy))
-            batch_results['coverage_star'].append(sum(1 for i in range(1, n) if adj[0,i]==1))
-            batch_results['coverage_mesh'].append(sum(1 for i in range(1, n) if hops[i]!=-1))
+        def play_loop():
+            if not playing["value"]:
+                return
+            next_idx = frame_idx.get() + 1
+            if next_idx >= len(trace):
+                playing["value"] = False
+                return
+            render_frame(next_idx)
+            scale.set(frame_idx.get())
+            viewer.after(250, play_loop)
 
-        # Вивід усереднених результатів
-        avg_text = f"""
-РЕЗУЛЬТАТИ СЕРІЇ З {iterations} ТЕСТІВ
--------------------------------------------
-Середній PDR Star: {np.mean(batch_results['star_pdr']):.2f}%
-Середній PDR Mesh: {np.mean(batch_results['mesh_pdr']):.2f}%
-ПЕРЕВАГА MESH ЗА PDR: {np.mean(batch_results['mesh_pdr']) - np.mean(batch_results['star_pdr']):.2f}%
+        def toggle_play():
+            playing["value"] = not playing["value"]
+            play_btn.configure(text="Пауза" if playing["value"] else "Play")
+            if playing["value"]:
+                play_loop()
 
-Сер. покриття Star: {np.mean(batch_results['coverage_star']):.1f} вузлів
-Сер. покриття Mesh: {np.mean(batch_results['coverage_mesh']):.1f} вузлів
+        ttk.Button(control, text="Prev", command=step_prev).pack(side=tk.RIGHT, padx=3)
+        play_btn = ttk.Button(control, text="Play", command=toggle_play)
+        play_btn.pack(side=tk.RIGHT, padx=3)
+        ttk.Button(control, text="Next", command=step_next).pack(side=tk.RIGHT, padx=3)
 
-Загальна енергія Star (сер.): {np.mean(batch_results['star_energy']):.4f} mAh
-Загальна енергія Mesh (сер.): {np.mean(batch_results['mesh_energy']):.4f} mAh
--------------------------------------------
-"""
-        print(avg_text)
-        tk.messagebox.showinfo("Результати серії тестів", avg_text)
-    
-    def show_results(self, hops, nodes_star, nodes_mesh, star_success_packets, mesh_success_packets, total_packets, star_energy, mesh_energy, load, parent, adj):
+        render_frame(0)
+
+    def run_batch_simulation(self, iterations=30):
+        scenarios = ("ideal", "noisy", "dense")
+        lines = ["РЕЗУЛЬТАТИ ПОРІВНЯННЯ (Star vs Mesh)"]
+        for scenario_name in scenarios:
+            star_pdr, mesh_pdr = [], []
+            star_delay, mesh_delay = [], []
+            for _ in range(iterations):
+                self.generate_obstacles()
+                self.generate_nodes()
+                engine = self.create_engine()
+                star = engine.simulate("star", scenario_name)
+                mesh = engine.simulate("mesh", scenario_name)
+                star_pdr.append(star["pdr"])
+                mesh_pdr.append(mesh["pdr"])
+                star_delay.append(star["avg_delay"])
+                mesh_delay.append(mesh["avg_delay"])
+
+            lines.append(
+                f"\n[{scenario_name.upper()}] PDR Star: {np.mean(star_pdr):.1f}% | PDR Mesh: {np.mean(mesh_pdr):.1f}% | ΔPDR: {np.mean(mesh_pdr) - np.mean(star_pdr):.1f}%"
+            )
+            lines.append(f"Delay Star: {np.mean(star_delay):.2f}s | Delay Mesh: {np.mean(mesh_delay):.2f}s")
+        messagebox.showinfo("Результати серії тестів", "\n".join(lines))
+
+    def show_results(self, star, mesh, scenario_name):
         res_win = tk.Toplevel(self.root)
-        res_win.title("Результати роботи мережі LoRa Star vs LoRa Mesh (SX1276)")
-        
-        star_pdr = (star_success_packets / total_packets) * 100 if total_packets > 0 else 0
-        mesh_pdr = (mesh_success_packets / total_packets) * 100 if total_packets > 0 else 0
-        
-        # Пошук найбільш завантажених вузлів
-        relay_loads = load[1:].copy()
-        top_relay_indices = np.argsort(relay_loads)[-3:][::-1] + 1 
-        
-        # Розрахунок середньої енергії
-        avg_mesh_energy = np.mean(mesh_energy[1:]) if len(mesh_energy) > 1 else 0
-        total_mesh_energy = np.sum(mesh_energy[1:])
+        res_win.title("Результати LoRa Star vs Mesh (динамічна SimPy-модель)")
 
-        avg_star_energy = np.mean(star_energy[1:]) if len(star_energy) > 1 else 0
-        total_star_energy = np.sum(star_energy[1:])
+        relay_loads = mesh["relay_load"][1:].copy()
+        sorted_relays = (np.argsort(relay_loads)[::-1] + 1).tolist()
+        while len(sorted_relays) < 3:
+            sorted_relays.append(1)
+        top_relay_indices = np.array(sorted_relays[:3])
 
-        # 1. Інтерфейс: Ліва панель
+        avg_mesh_energy = np.mean(mesh["energy"][1:]) if len(mesh["energy"]) > 1 else 0.0
+        total_mesh_energy = float(np.sum(mesh["energy"][1:]))
+        avg_star_energy = np.mean(star["energy"][1:]) if len(star["energy"]) > 1 else 0.0
+        total_star_energy = float(np.sum(star["energy"][1:]))
+
         info_frame = ttk.Frame(res_win)
         info_frame.pack(side=tk.LEFT, fill=tk.Y, padx=20, pady=20)
-        
         unit_label = "Дж" if self.unit_mode.get() == "Joules" else "mAh"
         sub_unit_label = "мДж" if self.unit_mode.get() == "Joules" else "mAh"
         mult = 1000 if self.unit_mode.get() == "Joules" else 1
-        
-        # Розрахунок розширення покриття
-        coverage_star = (nodes_star / len(self.nodes)) * 100
-        coverage_mesh = (nodes_mesh / len(self.nodes)) * 100
 
         results_text = f"""
 === МЕТРИКИ ЕФЕКТИВНОСТІ ===
+Сценарій: {scenario_name.upper()}
+Режим: {"Реалістичний (RSSI/SNR + колізії)" if self.link_model.get() == "realistic" else "Спрощений (по відстані)"}
+Маршрутизація Mesh: {self.routing_model.get()}
+Розміщення нод: {self.node_profile.get()} | Перешкоди: {self.obstacle_profile.get()}
 
 PDR (Доставка пакетів):
-• Star (LoRaWAN): {star_pdr:.1f}%
-• Mesh (LoRa):    {mesh_pdr:.1f}%
+• Star (LoRaWAN): {star['pdr']:.1f}%
+• Mesh (LoRa):    {mesh['pdr']:.1f}%
 
-ПЕРЕВАГА MESH: {mesh_pdr - star_pdr:.1f}%
+ПЕРЕВАГА MESH: {mesh['pdr'] - star['pdr']:.1f}%
+Сер. затримка (Star/Mesh): {star['avg_delay']:.2f}s / {mesh['avg_delay']:.2f}s
+Сер. ретраї (Star/Mesh): {star['avg_retry']:.2f} / {mesh['avg_retry']:.2f}
 
 ЕНЕРГОСПОЖИВАННЯ SX1276 ({unit_label})
 Загальне:
@@ -464,89 +502,72 @@ PDR (Доставка пакетів):
 • Mesh (LoRa):    {avg_mesh_energy * mult:.3f} {sub_unit_label}
 
 Покриття вузлів:
-• Star (LoRaWAN): {nodes_star}/{len(self.nodes)} вузлів
-• Mesh (LoRa):    {nodes_mesh}/{len(self.nodes)} вузлів
+• Star (LoRaWAN): {star['connected_nodes']}/{len(self.nodes)} вузлів
+• Mesh (LoRa):    {mesh['connected_nodes']}/{len(self.nodes)} вузлів
 
 Критичні вузли (для Mesh мережі):
-1. Вузол #{top_relay_indices[0]}: {int(load[top_relay_indices[0]])} пак.
-2. Вузол #{top_relay_indices[1]}: {int(load[top_relay_indices[1]])} пак.
-3. Вузол #{top_relay_indices[2]}: {int(load[top_relay_indices[2]])} пак.
+1. Вузол #{top_relay_indices[0]}: {int(mesh['relay_load'][top_relay_indices[0]])} пак.
+2. Вузол #{top_relay_indices[1]}: {int(mesh['relay_load'][top_relay_indices[1]])} пак.
+3. Вузол #{top_relay_indices[2]}: {int(mesh['relay_load'][top_relay_indices[2]])} пак.
 """
-        tk.Label(info_frame, text=results_text, justify=tk.LEFT, font=("Courier", 10), 
-                background="#f8f9fa", relief="solid", padx=15, pady=15).pack(pady=10)
-        
+        tk.Label(info_frame, text=results_text, justify=tk.LEFT, font=("Courier", 10), background="#f8f9fa", relief="solid", padx=15, pady=15).pack(pady=10)
         ttk.Button(info_frame, text="Закрити", command=res_win.destroy).pack(pady=10)
 
-        # Візуалізація шляхів
         fig_res, ax_res = plt.subplots(figsize=(6, 6))
-        all_pts = np.vstack([self.gateway_pos, self.nodes])
-        
-        # Малюємо перешкоди
+        all_pts = mesh["positions"]
         for obs in self.obstacles:
-            ax_res.add_patch(Rectangle((obs[0], obs[1]), obs[2], obs[3], color='red', alpha=0.4))
+            ax_res.add_patch(Rectangle((obs[0], obs[1]), obs[2], obs[3], color="red", alpha=0.4))
 
-        # Малюємо лінії зв'язку
         for i in range(1, len(all_pts)):
-            p = parent[i]
+            p = int(mesh["parent"][i])
             if p != -1:
                 ax_res.annotate(
-                    "", 
-                    xy=(all_pts[p,0], all_pts[p,1]),
-                    xytext=(all_pts[i,0], all_pts[i,1]),
-                    arrowprops=dict(
-                        arrowstyle="->", 
-                        color='green', 
-                        alpha=0.3, 
-                        lw=1.5,
-                        connectionstyle="arc3"
-                    ),
-                    zorder=2)
-                # ax_res.plot([all_pts[i,0], all_pts[j,0]], 
-                #             [all_pts[i,1], all_pts[j,1]], 
-                #             color='gray', linestyle='--', alpha=0.3, lw=1, zorder=2)
-        
-        max_energy = np.max(mesh_energy[1:]) if len(mesh_energy) > 1 else 1
-        # Малюємо вузли: Синій - Star ok, Зелений - Mesh ok, Червоний - Dead
-        for i in range(1, len(all_pts)):
-            has_direct_link = (adj[0, i] == 1)
-            is_connected_mesh = (hops[i] != -1)
+                    "",
+                    xy=(all_pts[p, 0], all_pts[p, 1]),
+                    xytext=(all_pts[i, 0], all_pts[i, 1]),
+                    arrowprops=dict(arrowstyle="->", color="green", alpha=0.3, lw=1.5, connectionstyle="arc3"),
+                    zorder=2,
+                )
 
+        max_energy = np.max(mesh["energy"][1:]) if len(mesh["energy"]) > 1 else 1
+        for i in range(1, len(all_pts)):
+            has_direct_link = bool(star["direct_links"][i]) if "direct_links" in star else False
+            is_connected_mesh = mesh["parent"][i] != -1
             if has_direct_link:
                 color = '#3498db'
-                label_type = "Star"
             elif is_connected_mesh:
                 color = '#2ecc71'
-                label_type = "Mesh Only"
             else:
                 color = '#e74c3c'
-                label_type = "No Signal"
-            
-            relative_energy = mesh_energy[i] / max_energy
-            node_size = 60 + (relative_energy * 400)
 
-            ax_res.scatter(all_pts[i,0], all_pts[i,1], c=color, s=node_size, edgecolors='black', alpha=0.7, zorder=3)
-            
-            # Додаємо підпис енергії для найбільш навантажених
-            if mesh_energy[i] > avg_mesh_energy * 1.5:
-                ax_res.text(all_pts[i,0], all_pts[i,1]-0.5, f"Node #{i+1} \n({mesh_energy[i]*mult:.2f} {sub_unit_label})", 
-                            fontsize=8, ha='center', color='#2c3e50', weight='bold')
+            relative_energy = mesh["energy"][i] / max_energy
+            node_size = 60 + (relative_energy * 400)
+            ax_res.scatter(all_pts[i, 0], all_pts[i, 1], c=color, s=node_size, edgecolors="black", alpha=0.7, zorder=3)
+
+            if mesh["energy"][i] > avg_mesh_energy * 1.5:
+                ax_res.text(
+                    all_pts[i, 0],
+                    all_pts[i, 1] - 0.5,
+                    f"Node #{i+1} \n({mesh['energy'][i]*mult:.2f} {sub_unit_label})",
+                    fontsize=8,
+                    ha="center",
+                    color="#2c3e50",
+                    weight="bold",
+                )
 
             if i in top_relay_indices:
-                ax_res.text(all_pts[i,0], all_pts[i,1]+0.2, "CRITICAL", 
-                            color='darkred', weight='bold', fontsize=8, ha='center')
+                ax_res.text(all_pts[i, 0], all_pts[i, 1] + 0.2, "CRITICAL", color="darkred", weight="bold", fontsize=8, ha="center")
 
-        # Gateway
-        ax_res.scatter(self.gateway_pos[0], self.gateway_pos[1], c='gold', s=450, 
-                       marker='*', edgecolors='black', label='Gateway', zorder=10)
-        
-        ax_res.set_title("Аналіз енергоспоживання та навантаження")
+        ax_res.scatter(self.gateway_pos[0], self.gateway_pos[1], c="gold", s=450, marker="*", edgecolors="black", label="Gateway", zorder=10)
+        ax_res.set_title("Динамічні маршрути Mesh + енергоспоживання")
         ax_res.set_xlabel("Відстань (км)")
         ax_res.set_ylabel("Відстань (км)")
-        ax_res.grid(True, linestyle=':', alpha=0.5)
-        
+        ax_res.grid(True, linestyle=":", alpha=0.5)
+
         canvas_res = FigureCanvasTkAgg(fig_res, master=res_win)
         canvas_res.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         canvas_res.draw()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
