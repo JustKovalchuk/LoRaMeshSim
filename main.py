@@ -11,6 +11,38 @@ from scene_builder import SceneBuilder, SceneConfig
 from simulation_core import LoRaSimulationEngine, SimulationConfig
 
 
+def node_color(direct, mesh_connected):
+    if direct and mesh_connected:
+        return "#3498db"
+    if mesh_connected:
+        return "#2ecc71"
+    return "#e74c3c"
+
+
+def draw_network_topology(ax, positions, parent, direct_links):
+    for i in range(1, len(positions)):
+        p = int(parent[i])
+        if p != -1:
+            ax.annotate(
+                "",
+                xy=(positions[p, 0], positions[p, 1]),
+                xytext=(positions[i, 0], positions[i, 1]),
+                arrowprops=dict(arrowstyle="->", color="green", alpha=0.3, lw=1.5, connectionstyle="arc3"),
+                zorder=2,
+            )
+    for i in range(1, len(positions)):
+        if direct_links[i]:
+            ax.plot(
+                [positions[i, 0], positions[0, 0]],
+                [positions[i, 1], positions[0, 1]],
+                color="#3498db",
+                alpha=0.25,
+                linewidth=1.0,
+                linestyle="--",
+                zorder=1,
+            )
+
+
 class LoRaMeshSim:
     def __init__(self, root):
         self.root = root
@@ -48,10 +80,11 @@ class LoRaMeshSim:
         self.obstacles_count = tk.IntVar(value=4)
         self.field_size = tk.DoubleVar(value=6.0)
         self.r_max = tk.DoubleVar(value=2.0)
-        self.mobility_speed = tk.DoubleVar(value=0.03)
-        self.mobility_step_s = tk.DoubleVar(value=1.0)
+        self.mobility_mode = tk.StringVar(value="static")
+        self.mobility_speed = tk.DoubleVar(value=0.004)
+        self.mobility_step_s = tk.DoubleVar(value=3.0)
         self.routing_update_s = tk.DoubleVar(value=3.0)
-        self.packet_interval_s = tk.DoubleVar(value=2.0)
+        self.packet_interval_s = tk.DoubleVar(value=60.0)
         self.max_retries = tk.IntVar(value=2)
         self.packets_per_node = tk.IntVar(value=30)
         self.scenario = tk.StringVar(value="ideal")
@@ -64,6 +97,8 @@ class LoRaMeshSim:
         self.nodes = None
         self.obstacles = []
         self.last_metrics = None
+        self._last_sim_velocities = None
+        self._last_scenario = None
         self.scene_builder = SceneBuilder(self.gateway_pos)
 
         self.setup_ui()
@@ -108,6 +143,7 @@ class LoRaMeshSim:
             routing_update_s=self.routing_update_s.get(),
             field_size=self.field_size.get(),
             unit_mode=self.unit_mode.get(),
+            mobility_enabled=self.mobility_mode.get() == "dynamic",
         )
 
     def create_engine(self):
@@ -191,6 +227,15 @@ class LoRaMeshSim:
         ttk.Label(ctrl_frame, text="R_max для режиму 'distance' (км):").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.r_max).pack()
 
+        ttk.Label(ctrl_frame, text="Режим мобільності:").pack(pady=5)
+        mobility_combo = ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.mobility_mode,
+            values=("static", "dynamic"),
+            state="readonly",
+        )
+        mobility_combo.pack(fill="x")
+
         ttk.Label(ctrl_frame, text="Пакетів на вузол:").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.packets_per_node).pack()
 
@@ -198,10 +243,21 @@ class LoRaMeshSim:
         ttk.Entry(ctrl_frame, textvariable=self.packet_interval_s).pack()
 
         ttk.Label(ctrl_frame, text="Швидкість руху (км/с):").pack(pady=5)
-        ttk.Entry(ctrl_frame, textvariable=self.mobility_speed).pack()
+        self.mobility_speed_entry = ttk.Entry(ctrl_frame, textvariable=self.mobility_speed)
+        self.mobility_speed_entry.pack(pady=2)
 
-        ttk.Label(ctrl_frame, text="Оновлення маршруту (с):").pack(pady=5)
-        ttk.Entry(ctrl_frame, textvariable=self.routing_update_s).pack()
+        ttk.Label(ctrl_frame, text="Крок руху (с):").pack(pady=5)
+        self.mobility_step_entry = ttk.Entry(ctrl_frame, textvariable=self.mobility_step_s)
+        self.mobility_step_entry.pack(pady=2)
+
+        def on_mobility_mode_change(*_args):
+            dynamic = self.mobility_mode.get() == "dynamic"
+            state = "normal" if dynamic else "disabled"
+            self.mobility_speed_entry.configure(state=state)
+            self.mobility_step_entry.configure(state=state)
+
+        self.mobility_mode.trace_add("write", on_mobility_mode_change)
+        on_mobility_mode_change()
 
         ttk.Label(ctrl_frame, text="Ретраї (без ACK):").pack(pady=5)
         ttk.Entry(ctrl_frame, textvariable=self.max_retries).pack()
@@ -210,7 +266,7 @@ class LoRaMeshSim:
         ttk.Combobox(
             ctrl_frame,
             textvariable=self.scenario,
-            values=("ideal", "noisy", "dense"),
+            values=("ideal", "noisy", "dense", "blocked"),
             state="readonly",
         ).pack(fill="x")
 
@@ -308,8 +364,12 @@ class LoRaMeshSim:
             return
         engine = self.create_engine()
         scenario_name = self.scenario.get()
-        star = engine.simulate("star", scenario_name)
-        mesh = engine.simulate("mesh", scenario_name)
+        n_nodes = len(self.nodes) + 1
+        velocities = engine.sample_velocities(n_nodes)
+        star = engine.simulate("star", scenario_name, velocities=velocities.copy())
+        mesh = engine.simulate("mesh", scenario_name, velocities=velocities.copy())
+        self._last_sim_velocities = velocities.copy()
+        self._last_scenario = scenario_name
         self.last_metrics = (star, mesh, scenario_name)
         self.show_results(star, mesh, scenario_name)
 
@@ -319,7 +379,16 @@ class LoRaMeshSim:
             return
         engine = self.create_engine()
         scenario_name = self.scenario.get()
-        mesh = engine.simulate("mesh", scenario_name, collect_trace=True, max_trace_steps=700)
+        n_nodes = len(self.nodes) + 1
+        if (
+            self._last_sim_velocities is not None
+            and self._last_scenario == scenario_name
+            and len(self._last_sim_velocities) == n_nodes
+        ):
+            velocities = self._last_sim_velocities.copy()
+        else:
+            velocities = engine.sample_velocities(n_nodes)
+        mesh = engine.simulate("mesh", scenario_name, collect_trace=True, max_trace_steps=700, velocities=velocities)
         trace = mesh.get("trace", [])
         if not trace:
             messagebox.showwarning("Немає даних", "Не вдалося зібрати кроки для візуалізації.")
@@ -359,19 +428,23 @@ class LoRaMeshSim:
 
             positions = frame["positions"]
             parent = frame["parent"]
+            direct_links = frame.get("direct_links", np.zeros(len(positions), dtype=bool))
 
-            for i in range(1, len(positions)):
-                p = int(parent[i])
-                if p != -1:
-                    ax.plot(
-                        [positions[i, 0], positions[p, 0]],
-                        [positions[i, 1], positions[p, 1]],
-                        color="#9acd32",
-                        alpha=0.45,
-                        linewidth=1.2,
-                    )
+            draw_network_topology(ax, positions, parent, direct_links)
 
-            ax.scatter(positions[1:, 0], positions[1:, 1], c="#7f8c8d", s=45, edgecolors="black", alpha=0.8)
+            colors = [
+                node_color(bool(direct_links[i]), int(parent[i]) != -1)
+                for i in range(1, len(positions))
+            ]
+            ax.scatter(
+                positions[1:, 0],
+                positions[1:, 1],
+                c=colors,
+                s=45,
+                edgecolors="black",
+                alpha=0.8,
+                zorder=3,
+            )
             ax.scatter(positions[0, 0], positions[0, 1], c="gold", s=300, marker="*", edgecolors="black", zorder=5)
 
             details = frame.get("details", {})
@@ -432,10 +505,13 @@ class LoRaMeshSim:
         play_btn.pack(side=tk.RIGHT, padx=3)
         ttk.Button(control, text="Next", command=step_next).pack(side=tk.RIGHT, padx=3)
 
-        render_frame(0)
+        end_indices = [i for i, f in enumerate(trace) if f.get("event") == "end"]
+        start_idx = end_indices[-1] if end_indices else len(trace) - 1
+        scale.set(start_idx)
+        render_frame(start_idx)
 
     def run_batch_simulation(self, iterations=30):
-        scenarios = ("ideal", "noisy", "dense")
+        scenarios = ("ideal", "noisy", "dense", "blocked")
         lines = ["РЕЗУЛЬТАТИ ПОРІВНЯННЯ (Star vs Mesh)"]
         for scenario_name in scenarios:
             star_pdr, mesh_pdr = [], []
@@ -444,8 +520,10 @@ class LoRaMeshSim:
                 self.generate_obstacles()
                 self.generate_nodes()
                 engine = self.create_engine()
-                star = engine.simulate("star", scenario_name)
-                mesh = engine.simulate("mesh", scenario_name)
+                n_nodes = len(self.nodes) + 1
+                velocities = engine.sample_velocities(n_nodes)
+                star = engine.simulate("star", scenario_name, velocities=velocities.copy())
+                mesh = engine.simulate("mesh", scenario_name, velocities=velocities.copy())
                 star_pdr.append(star["pdr"])
                 mesh_pdr.append(mesh["pdr"])
                 star_delay.append(star["avg_delay"])
@@ -482,6 +560,7 @@ class LoRaMeshSim:
 === МЕТРИКИ ЕФЕКТИВНОСТІ ===
 Сценарій: {scenario_name.upper()}
 Режим: {"Реалістичний (RSSI/SNR + колізії)" if self.link_model.get() == "realistic" else "Спрощений (по відстані)"}
+Мобільність: {"Динамічний" if self.mobility_mode.get() == "dynamic" else "Статичний"}
 Маршрутизація Mesh: {self.routing_model.get()}
 Розміщення нод: {self.node_profile.get()} | Перешкоди: {self.obstacle_profile.get()}
 
@@ -515,30 +594,19 @@ PDR (Доставка пакетів):
 
         fig_res, ax_res = plt.subplots(figsize=(6, 6))
         all_pts = mesh["positions"]
+        direct_links = mesh["direct_links"]
+        parent = mesh["parent"]
+
         for obs in self.obstacles:
             ax_res.add_patch(Rectangle((obs[0], obs[1]), obs[2], obs[3], color="red", alpha=0.4))
 
-        for i in range(1, len(all_pts)):
-            p = int(mesh["parent"][i])
-            if p != -1:
-                ax_res.annotate(
-                    "",
-                    xy=(all_pts[p, 0], all_pts[p, 1]),
-                    xytext=(all_pts[i, 0], all_pts[i, 1]),
-                    arrowprops=dict(arrowstyle="->", color="green", alpha=0.3, lw=1.5, connectionstyle="arc3"),
-                    zorder=2,
-                )
+        draw_network_topology(ax_res, all_pts, parent, direct_links)
 
         max_energy = np.max(mesh["energy"][1:]) if len(mesh["energy"]) > 1 else 1
         for i in range(1, len(all_pts)):
-            has_direct_link = bool(star["direct_links"][i]) if "direct_links" in star else False
-            is_connected_mesh = mesh["parent"][i] != -1
-            if has_direct_link:
-                color = '#3498db'
-            elif is_connected_mesh:
-                color = '#2ecc71'
-            else:
-                color = '#e74c3c'
+            has_direct_link = bool(direct_links[i])
+            is_connected_mesh = parent[i] != -1
+            color = node_color(has_direct_link, is_connected_mesh)
 
             relative_energy = mesh["energy"][i] / max_energy
             node_size = 60 + (relative_energy * 400)
@@ -559,7 +627,8 @@ PDR (Доставка пакетів):
                 ax_res.text(all_pts[i, 0], all_pts[i, 1] + 0.2, "CRITICAL", color="darkred", weight="bold", fontsize=8, ha="center")
 
         ax_res.scatter(self.gateway_pos[0], self.gateway_pos[1], c="gold", s=450, marker="*", edgecolors="black", label="Gateway", zorder=10)
-        ax_res.set_title("Динамічні маршрути Mesh + енергоспоживання")
+        mobility_label = "динамічний" if self.mobility_mode.get() == "dynamic" else "статичний"
+        ax_res.set_title(f"Маршрути Mesh ({mobility_label}) + енергоспоживання")
         ax_res.set_xlabel("Відстань (км)")
         ax_res.set_ylabel("Відстань (км)")
         ax_res.grid(True, linestyle=":", alpha=0.5)

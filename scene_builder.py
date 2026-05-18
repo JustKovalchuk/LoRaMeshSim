@@ -36,7 +36,6 @@ class Geometry:
             or r1[1] > r2[1] + r2[3]
         )
 
-
 @dataclass
 class SceneConfig:
     field_size: float

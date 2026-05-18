@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import math
 import random
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import simpy
@@ -34,6 +34,7 @@ class SimulationConfig:
     routing_update_s: float
     field_size: float
     unit_mode: str
+    mobility_enabled: bool
 
 
 class LoRaSimulationEngine:
@@ -53,6 +54,7 @@ class LoRaSimulationEngine:
         self.base_packet_interval_s = max(0.1, self.cfg.packet_interval_s)
         self.trace = []
         self.trace_limit = 0
+        self.apply_scenario("ideal")
 
     def _capture_snapshot(self, event_name, details=None):
         if self.trace_limit <= 0 or len(self.trace) >= self.trace_limit:
@@ -64,6 +66,7 @@ class LoRaSimulationEngine:
                 "details": details or {},
                 "positions": self.positions.copy(),
                 "parent": self.parent.copy(),
+                "direct_links": self.direct_links.copy(),
                 "success_packets": int(self.metrics["success_packets"]),
                 "total_packets": int(self.metrics["total_packets"]),
             }
@@ -95,6 +98,7 @@ class LoRaSimulationEngine:
 
     def apply_scenario(self, scenario_name):
         self.packet_interval_s = self.base_packet_interval_s
+        self.hard_obstacle_block = False
         if scenario_name == "ideal":
             self.noise_floor_dbm = -121.0
             self.shadow_sigma_db = 2.0
@@ -104,23 +108,34 @@ class LoRaSimulationEngine:
             self.shadow_sigma_db = 4.0
             self.obstacle_extra_loss_db = 24.0
         elif scenario_name == "dense":
-        else:
             self.noise_floor_dbm = -118.0
             self.shadow_sigma_db = 3.0
             self.obstacle_extra_loss_db = 22.0
             self.packet_interval_s = max(0.8, self.packet_interval_s * 0.6)
+        elif scenario_name == "blocked":
+            self.noise_floor_dbm = -120.0
+            self.shadow_sigma_db = 2.5
+            self.obstacle_extra_loss_db = 20.0
+            self.hard_obstacle_block = True
+        else:
+            self.noise_floor_dbm = -118.0
+            self.shadow_sigma_db = 3.0
+            self.obstacle_extra_loss_db = 22.0
 
     def compute_rssi_snr(self, p_tx, p_rx):
         d_km = max(np.linalg.norm(p_tx - p_rx), 0.001)
         shadow_db = random.gauss(0.0, self.shadow_sigma_db)
         loss_db = self.cfg.l0_db + 10 * self.cfg.path_loss_exp * math.log10(d_km * 1000) + shadow_db
-        if self.is_blocked(p_tx, p_rx):
+        if self.is_blocked(p_tx, p_rx) and not self.hard_obstacle_block:
             loss_db += self.obstacle_extra_loss_db
         rssi_dbm = self.cfg.current_tx_power - loss_db
         snr_db = rssi_dbm - self.noise_floor_dbm
         return rssi_dbm, snr_db
 
     def link_ok(self, p_tx, p_rx):
+        if self.hard_obstacle_block and self.is_blocked(p_tx, p_rx):
+            return False, -200.0
+
         if self.cfg.link_model == "distance":
             dist_km = np.linalg.norm(p_tx - p_rx)
             ok = dist_km <= self.cfg.distance_radius_km and not self.is_blocked(p_tx, p_rx)
@@ -168,6 +183,21 @@ class LoRaSimulationEngine:
                     costs[v] = costs[u] + edge_cost
                     parent[v] = u
         return parent
+
+    def update_topology(self):
+        self.parent = self.build_mesh_parent(self.positions)
+        n = len(self.positions)
+        self.direct_links = np.zeros(n, dtype=bool)
+        for i in range(1, n):
+            self.direct_links[i] = self.link_ok(self.positions[i], self.positions[0])[0]
+
+    def sample_velocities(self, n_nodes):
+        velocities = np.zeros((n_nodes, 2), dtype=float)
+        for i in range(1, n_nodes):
+            ang = random.uniform(0.0, 2 * math.pi)
+            speed = self.cfg.mobility_speed
+            velocities[i] = np.array([math.cos(ang) * speed, math.sin(ang) * speed])
+        return velocities
 
     def register_signal(self, receiver_id, signal):
         active = self.active_signals.setdefault(receiver_id, [])
@@ -287,15 +317,17 @@ class LoRaSimulationEngine:
                 if self.is_point_in_obstacle(self.positions[i][0], self.positions[i][1]):
                     self.positions[i] = old_pos
                     self.velocities[i] = -self.velocities[i]
+            self.update_topology()
             self._capture_snapshot("mobility")
 
-    def routing_process(self):
-        while True:
-            self.parent = self.build_mesh_parent(self.positions)
-            self._capture_snapshot("routing")
-            yield self.env.timeout(max(0.5, self.cfg.routing_update_s))
-
-    def simulate(self, mode, scenario_name, collect_trace=False, max_trace_steps=500):
+    def simulate(
+        self,
+        mode,
+        scenario_name,
+        collect_trace=False,
+        max_trace_steps=500,
+        velocities: Optional[np.ndarray] = None,
+    ):
         self.apply_scenario(scenario_name)
         self.mode = mode
         self.env = simpy.Environment()
@@ -304,13 +336,13 @@ class LoRaSimulationEngine:
         self.trace_limit = max_trace_steps if collect_trace else 0
 
         self.positions = np.vstack([self.gateway_pos, self.nodes]).astype(float)
-        self.velocities = np.zeros_like(self.positions)
-        for i in range(1, len(self.positions)):
-            ang = random.uniform(0.0, 2 * math.pi)
-            speed = self.cfg.mobility_speed
-            self.velocities[i] = np.array([math.cos(ang) * speed, math.sin(ang) * speed])
+        n_nodes = len(self.positions)
+        if velocities is not None:
+            self.velocities = np.array(velocities, dtype=float).copy()
+        else:
+            self.velocities = self.sample_velocities(n_nodes)
 
-        self.parent = self.build_mesh_parent(self.positions)
+        self.update_topology()
         self.metrics = {
             "total_packets": 0,
             "success_packets": 0,
@@ -321,21 +353,19 @@ class LoRaSimulationEngine:
         }
         self._capture_snapshot("start")
 
-        self.env.process(self.mobility_process())
-        if mode == "mesh":
-            self.env.process(self.routing_process())
+        if self.cfg.mobility_enabled:
+            self.env.process(self.mobility_process())
         for node_id in range(1, len(self.positions)):
             self.env.process(self.node_process(node_id))
 
         sim_horizon = self.cfg.packets_per_node * self.packet_interval_s + 15
         self.env.run(until=max(10.0, sim_horizon))
+        self.update_topology()
         self._capture_snapshot("end")
 
         connected = 0
-        direct_links = np.zeros(len(self.positions), dtype=bool)
         for i in range(1, len(self.positions)):
-            direct_links[i] = self.link_ok(self.positions[i], self.positions[0])[0]
-            if mode == "star" and direct_links[i]:
+            if mode == "star" and self.direct_links[i]:
                 connected += 1
             elif mode == "mesh" and self.parent[i] != -1:
                 connected += 1
@@ -353,6 +383,6 @@ class LoRaSimulationEngine:
             "connected_nodes": connected,
             "parent": self.parent.copy(),
             "positions": self.positions.copy(),
-            "direct_links": direct_links,
+            "direct_links": self.direct_links.copy(),
             "trace": self.trace,
         }
